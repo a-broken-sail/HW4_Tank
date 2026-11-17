@@ -5,9 +5,11 @@
   1. 高 DPI 适配：进程级 DPI 感知 + 内部超采样画布 + 平滑缩放到窗口；
   2. UI 布局与视觉细节：顶部状态栏 / 底部操作栏 / 扁平化矢量贴图；
   3. 通行判定：缩小判定盒 + 拐角辅助 + 车道居中，不再需要像素级对齐；
-  4. 音频：prelude.wav 开场、底噪循环、射击/命中音效全部即时构造（M 键静音）；
+  4. 音频：prelude.wav 开场 → 静置 3 秒 → bgm.wav 渐起并无缝循环（M 键静音），
+     射击 / 命中音效即时构造；
   5. 回车暂停 / 恢复（pause.wav），T 键切换手动 / 托管 AI；
-  6. 地图：原版 26×26 半格布局（坦克占 2×2 格），砖墙最小单位是半格。
+  6. 地图：原版 26×26 半格布局（坦克占 2×2 格），砖墙最小单位是半格；
+  7. 托管 AI：真实弹道判定（贴脸也能开火）+ 未来轨迹预测躲弹（不再只看当前对齐）。
 """
 
 import array
@@ -105,18 +107,21 @@ LANE_CENTER_STEP = px(2)      # 车道居中：每帧向车道中线靠拢的最
 # 托管 AI 参数
 AI_TURN_TOLERANCE = px(12)    # 离格子中心多近才允许拐弯
 AI_SHOOT_TOLERANCE = px(10)   # 与目标对齐到这个精度就可以开火
-AI_THREAT_RANGE = px(140)     # 判定“会打中我们”的子弹距离
-AI_DODGE_CLEARANCE = px(24)   # 需要横向让开多少才算脱离弹道
 AI_REPLAN_INTERVAL = 6        # 每隔多少帧重新规划一次路径
 AI_HOLD_DISTANCE = px(80)     # 已经能打到敌人时，保持这个距离点射
-AI_DODGE_FRAMES = 16          # 起躲之后锁定这个方向多少帧，避免又走回弹道
+AI_PEEK_COOLDOWN = 8          # 冷却还剩这么多帧时先侧移让开射线
 AI_PEEK_COOLDOWN = 8          # 冷却还剩这么多帧时先侧移让开射线
 AI_PEEK_HOLD = 12             # 侧移方向锁定帧数，避免挪一步撞墙又弹回来
 AI_PEEK_RANGE = px(160)       # 只有近处敌人才值得“侧移避枪”
-AI_BREAK_RANGE = px(150)      # 子弹在这个距离内、侧面又让不开时，砸砖开路
-AI_BRICK_COST = 5             # 寻路时穿过一个砖块格要付的代价（≈ 砸开它要花的帧数）
+AI_BRICK_COST = 12            # 寻路时穿过一个砖块格的代价
+                              # 打穿 1 格要 2 炮 = 60 帧，还要原地对格心；而走 1 格才 20 帧。
+                              # 定成 5 时 AI 会为了省几步去拆墙，实测 6.4 次/局、
+                              # 胜率反而更低（拆墙时原地不动，掩体也没了）。12 只会在死路时动手。
 AI_BREAK_HOLD = 90            # 决定砸墙后锁定多少帧，打不通不换目标
 AI_TARGET_STICKY = 2          # 换目标要等新目标比旧目标近这么多格，避免来回改主意
+AI_LOOKAHEAD = 18             # 躲弹前瞻帧数（子弹飞 216px / 车走 72px）
+AI_CLOSE_RANGE = px(80)       # 贴到这个距离就站定对射（约两个车身）
+AI_HOLD_PATIENCE = 150        # 站定点射最多忍这么多帧，打不掉就换位置
 
 _FONT_CACHE = {}
 
@@ -165,22 +170,18 @@ def compute_window_size(scale):
 
 
 # ===================== 音频 =====================
-# prelude.wav / pause.wav 由外部提供；底噪与音效全部即时构造，不依赖素材文件。
+# prelude.wav / pause.wav / bgm.wav 由外部提供；射击、命中音效即时构造。
 SAMPLE_RATE = 44100
 MUSIC_VOLUME = 0.55
-AMBIENCE_VOLUME = 0.28
+BGM_VOLUME = 0.40             # 背景音乐压在音效之下，别盖过开炮和命中
 UI_VOLUME = 0.70
 SHOT_VOLUME = 0.45
 HIT_VOLUME = 0.55
 
-# 底噪参数：对着参考录音拟合出来的（约 60Hz 的衰减脉冲串，不是白噪声）
-AMBIENCE_PULSE_HZ = 60        # 静止时的脉冲频率，听感上是“嗡嗡”的音高
-AMBIENCE_MOVE_PULSE_HZ = 88   # 开动时的脉冲频率（原版实测 88.4Hz）
-AMBIENCE_DECAY = 0.9985       # 每采样衰减，决定每个脉冲拖多长的尾巴
-AMBIENCE_SPREAD = 0.03        # 脉冲间隔的随机抖动，太大会把音高糊掉
-AMBIENCE_DC = 0.993           # 隔直系数：压掉随机幅度带来的低频漂移，否则基频被 30Hz 晃动盖住
-AMBIENCE_POSITIVE = 0.62      # 正向脉冲占比，越低波形越毛躁
-AMBIENCE_FADE_MS = 220        # 静止 / 移动两套底噪交叉淡化的时长
+BGM_DELAY_SECONDS = 3.0       # prelude 放完后静置多久，再让 bgm 渐起
+BGM_FADE_IN_SECONDS = 3.5     # bgm 从无声爬到正常音量要多久
+BGM_CROSSFADE_SECONDS = 1.5   # 首尾交叉淡化长度，决定循环接缝的平滑度
+BGM_FILE = "bgm.wav"
 AUDIO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -206,43 +207,41 @@ def _to_sound(samples, peak=0.9):
     return pygame.mixer.Sound(buffer=data.tobytes())
 
 
-def build_ambience(pulse_hz=AMBIENCE_PULSE_HZ, seconds=4.0, seed=20261115):
-    """老游戏底噪：约 60Hz 的衰减脉冲串。
+def load_bgm(name=BGM_FILE, crossfade=BGM_CROSSFADE_SECONDS):
+    """读取背景音乐，并把尾部与头部交叉淡化，让 loops=-1 循环时没有接缝。
 
-    对着参考录音量出来的：这不是白噪声，而是一串周期性触发的“脉冲 + 指数衰减”，
-    单个脉冲约 8ms 衰减掉，间隔随机抖动。听感是低沉的“嗡嗡”里混着沙沙的碎裂声。
-    坦克开动时原版会换成一路更高的脉冲（88Hz 左右），所以这里把频率做成参数。
+    做法：取出头部 fade 帧和尾部 fade 帧，线性混合成新的头部，
+    再丢掉原来的尾部。这样“新结尾的最后一个样本”和“新开头的第一个样本”
+    在原文件里本来就是相邻的，循环点天然连续；同时尾部那段淡出的余韵
+    也被铺到了开头，不会在每轮循环时出现几秒空档。
     """
-    rng = random.Random(seed)              # 独立随机源，不干扰玩法里的随机数
-    total = int(seconds * SAMPLE_RATE)
-    buffer = []
-    value = 0.0
-    previous_in = 0.0
-    previous_out = 0.0
-    index = 0
-    while index < total:
-        amplitude = rng.uniform(0.4, 1.0)
-        value += amplitude if rng.random() < AMBIENCE_POSITIVE else -amplitude
-        step = int(SAMPLE_RATE / pulse_hz * (1 + rng.uniform(-AMBIENCE_SPREAD, AMBIENCE_SPREAD)))
-        for _ in range(max(1, step)):
-            if index >= total:
-                break
-            value *= AMBIENCE_DECAY
-            # 隔直高通：脉冲幅度逐次随机会让波形整体缓慢漂移，
-            # 不压掉的话 30Hz 的晃动会盖过 60Hz 的基频，听起来就没有音高了。
-            output = value - previous_in + AMBIENCE_DC * previous_out
-            previous_in, previous_out = value, output
-            buffer.append(output)
-            index += 1
-
-    # 在末尾一小段里挑一个接近零的位置切断，循环接缝就不会“咔”一下
-    peak = max(max(buffer), -min(buffer)) or 1.0
-    end = len(buffer)
-    for cursor in range(len(buffer) - 1, len(buffer) - 2000, -1):
-        if abs(buffer[cursor]) < peak * 0.02:
-            end = cursor + 1
-            break
-    return _to_sound(buffer[:end], peak=0.7)
+    path = os.path.join(AUDIO_DIR, name)
+    if not os.path.isfile(path):
+        return None
+    try:
+        sound = pygame.mixer.Sound(path)
+    except (pygame.error, OSError):
+        return None
+    # 只有采样格式和 mixer 一致时，get_raw() 才是 16 位立体声交织样本
+    if pygame.mixer.get_init() != (SAMPLE_RATE, -16, 2) or crossfade <= 0:
+        return sound
+    try:
+        data = array.array("h")
+        data.frombytes(sound.get_raw())
+        frames = len(data) // 2
+        fade = min(int(crossfade * SAMPLE_RATE), frames // 4)
+        if fade < 2:
+            return sound
+        head = array.array("h", data[: fade * 2])
+        tail_start = (frames - fade) * 2
+        span = fade * 2
+        for index in range(span):
+            weight = index / span
+            head[index] = int(head[index] * weight + data[tail_start + index] * (1.0 - weight))
+        buffer = head + data[fade * 2: tail_start]
+        return pygame.mixer.Sound(buffer=buffer.tobytes())
+    except (pygame.error, ValueError):
+        return sound
 
 
 def build_shot_sound():
@@ -648,16 +647,19 @@ class TankGame:
         # 托管 AI 的运行时状态
         self._cell_walls = None
         self._wall_count = -1
+        self._tile_walls = None     # 半格墙体表，射线判定用
+        self._tile_count = -1
         self.ai_path = None
         self.ai_heading = None
         self.ai_replan = 0
-        self.ai_dodge = 0
-        self.ai_dodge_dir = None
         self.ai_target = None       # 当前锁定的目标敌人，避免来回换目标
         self.ai_break_hold = 0      # 砸墙锁定的剩余帧数
         self.ai_break_dir = None
         self.ai_peek_dir = None     # 侧移避枪的锁定方向
         self.ai_peek_hold = 0
+        self.ai_wander_dir = None   # 兜底方向的锁，避免每帧重挑
+        self.ai_wander_hold = 0
+        self.ai_hold_frames = 0     # 站定点射已经站了多少帧
         self.reset_music()
 
     def handle_events(self):
@@ -686,41 +688,35 @@ class TankGame:
     def setup_audio(self):
         self.prelude = None
         self.pause_sound = None
-        self.ambience = None
-        self.ambience_move = None
+        self.bgm = None
         self.shot_sound = None
         self.hit_sound = None
         self.music_channel = None
         self.ui_channel = None
-        self.ambience_channels = ()
-        self.ambience_index = 0
-        self.ambience_moving = None
         self.audio_muted = False
-        self.music_pending = False
         self.music_resume_pending = False
+        self.bgm_pending = False    # prelude 还在放，等它结束
+        self.bgm_delay = 0          # prelude 结束后还要静置多少帧
         if pygame.mixer.get_init() is None:
             return
 
         self.prelude = load_sound("prelude.wav")
         self.pause_sound = load_sound("pause.wav")
+        self.bgm = load_bgm()
         if pygame.mixer.get_init() == (SAMPLE_RATE, -16, 2):
             try:
-                self.ambience = build_ambience(AMBIENCE_PULSE_HZ)
-                self.ambience_move = build_ambience(AMBIENCE_MOVE_PULSE_HZ, seed=771)
                 self.shot_sound = build_shot_sound()
                 self.hit_sound = build_hit_sound()
             except (pygame.error, ValueError):
                 pass
         try:
             pygame.mixer.set_num_channels(16)
-            pygame.mixer.set_reserved(4)
+            pygame.mixer.set_reserved(2)     # 0 号给音乐、1 号给界面音，音效抢不走
             self.music_channel = pygame.mixer.Channel(0)
             self.ui_channel = pygame.mixer.Channel(1)
-            self.ambience_channels = (pygame.mixer.Channel(2), pygame.mixer.Channel(3))
         except pygame.error:
             self.music_channel = None
             self.ui_channel = None
-            self.ambience_channels = ()
 
     def play_sfx(self, sound, volume=1.0):
         if sound is None or self.audio_muted:
@@ -737,46 +733,32 @@ class TankGame:
         self.ui_channel.play(sound)
 
     def music_channels(self):
-        """所有会随暂停一起停的声道。"""
-        channels = [self.music_channel, *self.ambience_channels]
-        return [channel for channel in channels if channel is not None]
+        """所有会随暂停一起停的声道（prelude 和 bgm 共用 0 号）。"""
+        return [self.music_channel] if self.music_channel is not None else []
 
-    def set_ambience(self, moving, force=False):
-        """切换静止 / 移动两套底噪，用两声道做交叉淡化。
-
-        坦克一动就切到高八度那套（原版实测 61.9Hz → 88.4Hz），停住再切回来。
-        """
-        if moving == self.ambience_moving and not force:
+    def start_bgm(self):
+        """渐起播放背景音乐：音量从 0 爬到 BGM_VOLUME，之后无缝循环。"""
+        if self.bgm is None or self.music_channel is None:
             return
-        sound = self.ambience_move if moving else self.ambience
-        if sound is None or not self.ambience_channels:
-            self.ambience_moving = moving
-            return
-
-        current = self.ambience_channels[self.ambience_index]
-        following = self.ambience_channels[1 - self.ambience_index]
-        current.fadeout(AMBIENCE_FADE_MS)
-        following.set_volume(AMBIENCE_VOLUME)
-        following.play(sound, loops=-1, fade_ms=AMBIENCE_FADE_MS)
-        self.ambience_index = 1 - self.ambience_index
-        self.ambience_moving = moving
+        self.music_channel.set_volume(BGM_VOLUME)
+        self.music_channel.play(self.bgm, loops=-1,
+                                fade_ms=int(BGM_FADE_IN_SECONDS * 1000))
 
     def reset_music(self):
-        """开局先放 prelude.wav，放完自动接底噪。"""
+        """开局先放 prelude.wav；放完静置 BGM_DELAY_SECONDS 秒，再让 bgm 渐起。"""
         self.paused = False
         self.music_resume_pending = False
-        self.ambience_moving = None
+        self.bgm_pending = False
+        self.bgm_delay = 0
         if self.music_channel is None:
-            self.music_pending = False
             return
         pygame.mixer.stop()                 # 先掐掉上一局残留的音效，别和开场曲叠在一起
         if self.prelude is not None:
-            self.music_channel.play(self.prelude)
             self.music_channel.set_volume(MUSIC_VOLUME)
-            self.music_pending = True
-        else:
-            self.music_pending = False
-            self.set_ambience(False, force=True)
+            self.music_channel.play(self.prelude)
+            self.bgm_pending = True
+        elif self.bgm is not None:
+            self.start_bgm()                # 没有前奏就直接起 bgm
 
     def toggle_pause(self):
         """回车暂停 / 恢复。
@@ -834,18 +816,20 @@ class TankGame:
         if self.game_over or self.paused:
             return
 
-        # 恢复时先让 pause 响完，再把没放完的音乐接上
+        # 音乐时序：恢复时先让 pause 响完 → prelude 放完 → 静置 3 秒 → bgm 渐起
         if self.music_channel is not None:
             if self.music_resume_pending and not self.ui_channel.get_busy():
                 self.music_resume_pending = False
-                for channel in self.music_channels():
-                    channel.unpause()
-            if (self.music_pending and not self.music_resume_pending
-                    and not self.music_channel.get_busy()):
-                self.music_pending = False      # 前奏放完了，接上底噪
-                self.set_ambience(False, force=True)
+                self.music_channel.unpause()
+            if self.bgm_pending and not self.music_resume_pending:
+                if not self.music_channel.get_busy():
+                    self.bgm_pending = False
+                    self.bgm_delay = int(BGM_DELAY_SECONDS * FPS)
+            elif self.bgm_delay > 0:
+                self.bgm_delay -= 1
+                if self.bgm_delay == 0:
+                    self.start_bgm()
 
-        position = self.player.rect.topleft
         if self.auto_pilot:
             self.auto_play()
         else:
@@ -864,10 +848,6 @@ class TankGame:
                 self.player.move(self.player.speed, 0, self.walls, self.all_sprites)
 
         self.player.update(self.walls, self.all_sprites)
-
-        # 坦克一开动就把底噪换成高音那套，停下来再换回去
-        if not self.music_pending:
-            self.set_ambience(self.player.rect.topleft != position)
 
         for enemy in self.enemies:
             self.ai_move(enemy)
@@ -918,6 +898,7 @@ class TankGame:
             self.win = True
 
     def ai_move(self, enemy):
+        """敌方坦克行进：撞墙或随机概率就换方向，开火由 update 里的随机逻辑负责。"""
         dx, dy = enemy.direction
         success = enemy.move(dx * enemy.speed, dy * enemy.speed, self.walls, self.all_sprites)
         if not success or random.random() < 0.02:
@@ -927,9 +908,15 @@ class TankGame:
     # 每帧的优先级：开火（不占用移动）> 躲弹 > 侧移避枪 > 沿 BFS 路径逼近最近的敌人。
 
     def cell_of(self, rect):
-        """矩形左上角所在的坦克格坐标（一格 = 一个车身 = 2×2 个半格）。"""
-        return (round((rect.x - self.offset_x) / BLOCK_SIZE),
-                round((rect.y - self.offset_y) / BLOCK_SIZE))
+        """车身**中心**所在的坦克格坐标（一格 = 一个车身 = 2×2 个半格）。
+
+        必须用中心点向下取整，不能拿左上角四舍五入：
+        车体跨在格边界上时，左上角可能还在左边那格，车身其实已经压在右边格，
+        round(0.5) 又会往偶数取整，于是“当前格”被算到有砖的那一侧 ——
+        寻路认为从砖里出发，规划出来就是一路打墙。
+        """
+        return (int((rect.centerx - self.offset_x) // BLOCK_SIZE),
+                int((rect.centery - self.offset_y) // BLOCK_SIZE))
 
     def wall_grid(self):
         """坦克格 -> 墙体类型；砖块被打掉后按墙体数量自动重建。
@@ -997,74 +984,255 @@ class TankGame:
                 heapq.heappush(frontier, (new_cost, len(came_from), nxt))
         return None
 
-    def ai_shot_line_clear(self, enemy):
-        """与敌人同排/同列、且中间没有任何墙时返回 True。
+    def ai_tile_grid(self):
+        """半格精度的墙体表，专门用来模拟子弹弹道。
 
-        砖墙也算阻挡：这个游戏里子弹碰到砖就没了，一炮只打掉半格砖。
-        以前把砖当“能打穿、不算阻挡”，结果 AI 站在墙后面自认为在点射，
-        其实每一炮都喂给了墙 —— 打墙要由寻路阶段显式决定，不能混在开火判断里。
+        wall_grid 为了寻路把 2×2 个半格合并成一个坦克格，对“这一炮能不能打到”
+        来说太粗了：贴脸时两车之间可能只隔着半格砖。射线判定必须用细网格。
         """
-        player = self.player.rect
-        player_x, player_y = player.center
-        enemy_x, enemy_y = enemy.rect.center
-        cell = self.cell_of(player)
-        goal = self.cell_of(enemy.rect)
-        grid = self.wall_grid()
+        if self._tile_walls is None or self._tile_count != len(self.walls):
+            cells = {}
+            for wall in self.walls:
+                start_col = int((wall.rect.x - self.offset_x) // TILE_SIZE)
+                start_row = int((wall.rect.y - self.offset_y) // TILE_SIZE)
+                span_cols = max(1, wall.rect.width // TILE_SIZE)
+                span_rows = max(1, wall.rect.height // TILE_SIZE)
+                for dc in range(span_cols):
+                    for dr in range(span_rows):
+                        cells[(start_col + dc, start_row + dr)] = wall.wall_type
+            self._tile_walls = cells
+            self._tile_count = len(self.walls)
+        return self._tile_walls
 
-        if abs(player_y - enemy_y) <= AI_SHOOT_TOLERANCE and abs(player_x - enemy_x) > BLOCK_SIZE // 2:
-            step = 1 if enemy_x > player_x else -1
-            for col in range(cell[0] + step, goal[0] + step, step):
-                if (col, cell[1]) in grid:
-                    return False
-            return True
+    def ai_ray_hits(self, direction, target, origin):
+        """从 origin 车身边缘按子弹真实步长往前推：先碰到 target 算命中，先撞墙算挡住。
 
-        if abs(player_x - enemy_x) <= AI_SHOOT_TOLERANCE and abs(player_y - enemy_y) > BLOCK_SIZE // 2:
-            step = 1 if enemy_y > player_y else -1
-            for row in range(cell[1] + step, goal[1] + step, step):
-                if (cell[0], row) in grid:
-                    return False
-            return True
+        起点做成参数，敌方坦克瞄准玩家时也走同一套判定。以前敌人是朝当前朝向
+        随机开火，实测三成炮弹打在墙上 —— 一局十几块砖其实都是它们拆的。
+        """
+        dx, dy = direction
+        step = px(6)                      # 与 Bullet.speed 保持一致
+        grid = self.ai_tile_grid()
+        x, y = origin.center
+        x += dx * (BLOCK_SIZE // 2)       # 从车身边缘起步，别把自己算进去
+        y += dy * (BLOCK_SIZE // 2)
+        probe = pygame.Rect(0, 0, px(8), px(8))
+        for _ in range(120):
+            probe.center = (x, y)
+            if probe.colliderect(target):
+                return True
+            if not PLAY_RECT.colliderect(probe):
+                return False
+            # 子弹有 16px 宽，**中心点没进砖格不代表不会撞砖**。
+            # 只查中心所在格时，子弹擦着砖边飞会被判成“畅通”，
+            # AI 于是站定连射，实际每一炮都在拆墙 —— 这是“爱打墙”的主因。
+            # 这里检查 probe 覆盖到的所有半格。
+            left = int((probe.left - self.offset_x) // TILE_SIZE)
+            right = int((probe.right - self.offset_x) // TILE_SIZE)
+            top = int((probe.top - self.offset_y) // TILE_SIZE)
+            bottom = int((probe.bottom - self.offset_y) // TILE_SIZE)
+            for col in range(left, right + 1):
+                for row in range(top, bottom + 1):
+                    if grid.get((col, row)):
+                        return False
+            x += dx * step
+            y += dy * step
         return False
 
+    def ai_aim_at(self, origin, target):
+        """从 origin 要打中 target 该朝哪；两侧都不通返回 None。
+
+        主轴打不通就试副轴：贴脸时两车经常错开半格，沿副轴打反而能擦到。
+        """
+        dx = target.centerx - origin.centerx
+        dy = target.centery - origin.centery
+        if abs(dx) >= abs(dy):
+            first = RIGHT if dx > 0 else LEFT
+            second = DOWN if dy > 0 else UP
+        else:
+            first = DOWN if dy > 0 else UP
+            second = RIGHT if dx > 0 else LEFT
+        for direction in (first, second):
+            if self.ai_ray_hits(direction, target, origin):
+                return direction
+        return None
+
+    def ai_ray_hits_enemy(self, direction, enemy):
+        """玩家朝这个方向能不能打中这个敌人。"""
+        return self.ai_ray_hits(direction, enemy.rect, self.player.rect)
+
+    def ai_aim_direction(self, enemy):
+        """玩家要打中这个敌人炮口该朝哪；打不到返回 None。"""
+        return self.ai_aim_at(self.player.rect, enemy.rect)
+
+    def ai_shot_line_clear(self, enemy):
+        """有射界就返回 True（统一走真实弹道模拟，和 ai_shoot 用同一把尺子）。"""
+        return self.ai_aim_direction(enemy) is not None
+
     def ai_shoot(self):
+        """能打中就打，近的目标优先。转身和开火都走真实弹道判定。"""
         if self.player.cooldown > 0:
             return False
-        for enemy in self.enemies:
-            if not self.ai_shot_line_clear(enemy):
+        player = self.player.rect
+        targets = sorted(self.enemies,
+                         key=lambda item: abs(item.rect.centerx - player.centerx)
+                         + abs(item.rect.centery - player.centery))
+        for enemy in targets:
+            direction = self.ai_aim_direction(enemy)
+            if direction is None:
                 continue
-            # 先转炮口再开火：子弹是朝车身朝向飞出去的。
-            # 不转身的话，原地“点射”其实是在对着旁边的墙打，永远打不中。
-            dx = enemy.rect.centerx - self.player.rect.centerx
-            dy = enemy.rect.centery - self.player.rect.centery
-            if abs(dx) >= abs(dy):
-                self.player.set_direction(RIGHT if dx > 0 else LEFT)
-            else:
-                self.player.set_direction(DOWN if dy > 0 else UP)
+            # 先转炮口再开火：子弹是朝车身朝向飞出去的
+            self.player.set_direction(direction)
             if self.player.can_shoot():
                 self.shoot(self.player)
                 return True
         return False
 
-    def ai_danger(self):
-        """返回最紧迫的一发“正对着我们”的敌方子弹：(剩余距离, dx, dy, x, y)。"""
+    def ai_bullet_tracks(self, horizon=AI_LOOKAHEAD):
+        """预测所有敌方子弹未来 horizon 帧的位置，撞墙之后的帧记为 None。
+
+        返回 [(dx, dy, track)]。躲弹必须基于“未来会不会撞上”，而不是
+        “现在是否已经对齐”：后者要等子弹贴脸才报警，车正沿 y 轴往弹道上走时
+        完全察觉不到，等发现时已经躲不开了。
+        """
         player = self.player.rect
-        worst = None
+        grid = self.ai_tile_grid()
+        tracks = []
         for bullet in self.bullets:
             if bullet.owner != ENEMY:
                 continue
+            # 粗筛：横向纵向都离我们很远的不必逐帧算
+            if (abs(bullet.rect.centerx - player.centerx) > px(300)
+                    and abs(bullet.rect.centery - player.centery) > px(300)):
+                continue
             dx, dy = bullet.direction
-            bullet_x, bullet_y = bullet.rect.center
-            if dy == 0:
-                if abs(bullet_y - player.centery) > AI_DODGE_CLEARANCE:
+            x, y = bullet.rect.center
+            track = []
+            gone = False
+            for _ in range(horizon + 1):
+                if gone:
+                    track.append(None)
                     continue
-                ahead = (player.centerx - bullet_x) * dx
-            else:
-                if abs(bullet_x - player.centerx) > AI_DODGE_CLEARANCE:
+                track.append((x, y))
+                col = int((x - self.offset_x) // TILE_SIZE)
+                row = int((y - self.offset_y) // TILE_SIZE)
+                if grid.get((col, row)):
+                    gone = True          # 这一帧还在飞，下一帧撞墙消失
+                x += dx * bullet.speed
+                y += dy * bullet.speed
+            tracks.append((dx, dy, track))
+        return tracks
+
+    def ai_first_hit(self, direction, tracks=None, horizon=AI_LOOKAHEAD):
+        """沿这个方向匀速走，最早第几帧会被打中；一直安全返回 None。
+
+        这就是“前方路径是否安全”的答案：把车的未来轨迹和子弹的未来轨迹
+        逐帧比一次，而不是看当前是否在同一条弹道上。
+        """
+        if tracks is None:
+            tracks = self.ai_bullet_tracks(horizon)
+        if not tracks:
+            return None
+        rect = self.player.rect
+        half_w = rect.width / 2 + px(4)
+        half_h = rect.height / 2 + px(4)
+        cx, cy = rect.center
+        speed = self.player.speed
+        for frame in range(horizon + 1):
+            x = cx + direction[0] * speed * frame
+            y = cy + direction[1] * speed * frame
+            for _, _, track in tracks:
+                pos = track[frame]
+                if pos is None:
                     continue
-                ahead = (player.centery - bullet_y) * dy
-            if 0 < ahead <= AI_THREAT_RANGE and (worst is None or ahead < worst[0]):
-                worst = (ahead, dx, dy, bullet_x, bullet_y)
-        return worst
+                if abs(pos[0] - x) <= half_w and abs(pos[1] - y) <= half_h:
+                    return frame
+        return None
+
+    def ai_pick_safe(self, intent, tracks=None):
+        """给一个想走的方向，如果会撞进弹道就换一条更安全的。
+
+        评分 = 最早被击中的帧数 + 各方向权重：
+          · 原方向 +0.5，一样安全时不要无故改道；
+          · 垂直于弹道 +0.2，横着让开比顺弹道跑有效；
+          · 能连续走多远，每步 +0.08。
+        最后一项很关键：走廊里上下都是墙时，UP/DOWN 各只有一步可走，
+        如果只按“安全帧数”打分，两者同分，会按循环顺序每帧来回翻；
+        按可走距离加权后，通顺的那条轴会稳定胜出。
+        """
+        if tracks is None:
+            tracks = self.ai_bullet_tracks()
+        if not tracks:
+            return intent
+
+        urgent = None
+        for dx, dy, track in tracks:
+            hit = self.ai_first_hit(STAY, [(dx, dy, track)])
+            if hit is None:
+                continue
+            if urgent is None or hit < urgent[0]:
+                urgent = (hit, dx, dy)
+        perpendicular = ()
+        if urgent:
+            perpendicular = (UP, DOWN) if urgent[2] == 0 else (LEFT, RIGHT)
+
+        best_score, best_direction = -1.0, None
+        for direction in (intent, UP, DOWN, LEFT, RIGHT):
+            if direction is None or direction == STAY:
+                continue
+            if not self.ai_can_step(direction):
+                continue
+            hit = self.ai_first_hit(direction, tracks)
+            score = float(AI_LOOKAHEAD + 1 if hit is None else hit)
+            if direction == intent:
+                score += 0.5
+            if direction in perpendicular:
+                score += 0.2
+            score += min(6, self.ai_clearance(direction, 6)) * 0.08
+            if score > best_score:
+                best_score, best_direction = score, direction
+        return best_direction if best_direction is not None else intent
+
+    def ai_dodge_direction(self, tracks=None):
+        """紧急避弹：在所有能走的方向里挑“最晚被击中”的，垂直弹道优先。"""
+        if tracks is None:
+            tracks = self.ai_bullet_tracks()
+        if not tracks:
+            return None
+
+        # 最紧迫的那一发决定“哪个方向算垂直”
+        urgent = None
+        for dx, dy, track in tracks:
+            hit = self.ai_first_hit(STAY, [(dx, dy, track)])
+            if hit is None:
+                continue
+            if urgent is None or hit < urgent[0]:
+                urgent = (hit, dx, dy)
+        perpendicular = ()
+        if urgent:
+            perpendicular = (UP, DOWN) if urgent[2] == 0 else (LEFT, RIGHT)
+
+        best_score, best_direction = -1.0, None
+        for direction in (UP, DOWN, LEFT, RIGHT):
+            if not self.ai_can_step(direction):
+                continue
+            hit = self.ai_first_hit(direction, tracks)
+            score = float(AI_LOOKAHEAD + 1 if hit is None else hit)
+            if direction in perpendicular:
+                score += 0.25      # 垂直让开比顺弹道跑有效得多
+            score += min(6, self.ai_clearance(direction, 6)) * 0.08
+            if score > best_score:
+                best_score, best_direction = score, direction
+
+        # 三条路都会被打中：垂直那侧是砖就打穿它博一把（原版里唯一的活路）
+        if best_score < AI_LOOKAHEAD // 3:
+            for direction in perpendicular:
+                if self.ai_brick_ahead(direction) and self.player.cooldown == 0:
+                    self.ai_break_dir = direction
+                    self.ai_break_hold = AI_BREAK_HOLD
+                    self.ai_shoot_block(direction)
+                    return STAY
+        return best_direction
 
     def ai_can_step(self, direction):
         dx, dy = direction
@@ -1115,10 +1283,12 @@ class TankGame:
         return True
 
     def ai_evade(self):
-        """有子弹朝我们飞来时，垂直于弹道让开；侧面让不开就把砖打穿。
+        """紧急避弹：原地就会被打中时立刻让开。
 
-        方向一旦选定就锁住若干帧：否则刚让开一点就回头赶路，
-        正好又撞回同一发子弹的弹道。
+        返回方向 / STAY（正在打穿砖墙）/ None（暂时不用躲）。
+        “沿路走会撞进弹道”这种还没发生的威胁不在这里处理 —— 那是 auto_play
+        里 ai_pick_safe 的活。如果这里也管，AI 会为了躲还没到的子弹放弃整条
+        路线，结果原地反复改主意。
         """
         # 已经决定砸墙了就先把这个洞打通，别中途改主意（改一次洞就白打了）
         if self.ai_break_hold > 0:
@@ -1128,68 +1298,68 @@ class TankGame:
                 return STAY
             self.ai_break_hold = 0
 
-        danger = self.ai_danger()
-        if danger is not None:
-            _, dx, dy, bullet_x, bullet_y = danger
-            player = self.player.rect
-            if dy:
-                offset = player.centerx - bullet_x
-                options = (RIGHT, LEFT) if offset > 0 else (LEFT, RIGHT)
-            else:
-                offset = player.centery - bullet_y
-                options = (DOWN, UP) if offset > 0 else (UP, DOWN)
+        tracks = self.ai_bullet_tracks()
+        if not tracks:
+            return None
+        if self.ai_first_hit(STAY, tracks) is None:
+            return None          # 站着不动就打不中，交给正常推进
+        return self.ai_dodge_direction(tracks)
 
-            # 两侧各能挪多远；够半个车身才算真的让得开
-            best_direction, best_room = None, 0
-            for rank, direction in enumerate(options):
-                room = self.ai_lateral_room(direction) - rank * px(2)
-                if room > best_room:
-                    best_room, best_direction = room, direction
+    def ai_nearest_open(self, cell):
+        """把“落在墙里”的目标格换成最近的可通行格。
 
-            # 侧面根本让不开（走廊、夹缝）：顺着通道跑是跑不过子弹的。
-            # 旁边的砖可以直接打穿，那就打穿它钻出去，而不是回头找现成的路口。
-            if best_room < AI_DODGE_CLEARANCE and danger[0] < AI_BREAK_RANGE:
-                for direction in options:
-                    if self.ai_brick_ahead(direction):
-                        self.ai_break_dir = direction
-                        self.ai_break_hold = AI_BREAK_HOLD
-                        self.ai_shoot_block(direction)
-                        return STAY
+        敌人压在格边界上时，cell_of 的四舍五入会把它算进旁边那格砖里。
+        这时寻路会认为“目标在墙里面”，唯一能到的方式就是一路打穿 ——
+        明明敌人就在墙边的通道上。这是“爱打墙”最主要的一条来源。
+        """
+        grid = self.wall_grid()
+        if grid.get(cell) not in (BRICK, STEEL, BASE):
+            return cell
+        best = None
+        for dc in range(-2, 3):
+            for dr in range(-2, 3):
+                if not dc and not dr:
+                    continue
+                candidate = (cell[0] + dc, cell[1] + dr)
+                if not (0 <= candidate[0] < MAP_COLS // 2
+                        and 0 <= candidate[1] < MAP_ROWS // 2):
+                    continue
+                if grid.get(candidate) in (BRICK, STEEL, BASE):
+                    continue
+                distance = abs(dc) + abs(dr)
+                if best is None or distance < best[0]:
+                    best = (distance, candidate)
+        return best[1] if best else cell
 
-            if best_direction is not None:
-                self.ai_dodge = AI_DODGE_FRAMES
-                self.ai_dodge_dir = best_direction
-                return best_direction
-
-        if self.ai_dodge > 0:
-            self.ai_dodge -= 1
-            if self.ai_dodge_dir and self.ai_can_step(self.ai_dodge_dir):
-                return self.ai_dodge_dir
-            self.ai_dodge = 0
-        return None
+    def ai_path_cost(self, path):
+        """把路径折算成代价：走一格算 1，打穿一格砖算 AI_BRICK_COST。"""
+        grid = self.wall_grid()
+        return sum(AI_BRICK_COST if grid.get(cell) == BRICK else 1 for cell in path)
 
     def ai_plan(self, cell):
         """选目标敌人并返回路径。
 
         上一次的目标只要没被明显甩开就继续用 —— 两台敌人距离接近时，
         每帧重算会来回换目标，路也跟着来回改，车身就开始抽。
+        排序用**代价**而不是格数：一条 4 格但穿 3 堵砖的路，远比绕 9 格空路贵。
         """
         paths = []
         for enemy in self.enemies:
-            path = self.find_path(cell, self.cell_of(enemy.rect))
+            goal = self.ai_nearest_open(self.cell_of(enemy.rect))
+            path = self.find_path(cell, goal)
             if path is not None:
-                paths.append((len(path), enemy, path))
+                paths.append((self.ai_path_cost(path), len(path), enemy, path))
         if not paths:
             self.ai_target = None
             return None
-        paths.sort(key=lambda item: item[0])
+        paths.sort(key=lambda item: (item[0], item[1]))
 
         if self.ai_target is not None and self.ai_target in self.enemies:
-            for length, enemy, path in paths:
-                if enemy is self.ai_target and length <= paths[0][0] + AI_TARGET_STICKY:
+            for cost, _, enemy, path in paths:
+                if enemy is self.ai_target and cost <= paths[0][0] + AI_TARGET_STICKY:
                     return path
-        self.ai_target = paths[0][1]
-        return paths[0][2]
+        self.ai_target = paths[0][2]
+        return paths[0][3]
 
     def ai_direct_direction(self, cell):
         """没有通路时的兜底：朝敌人方向硬推，优先走能走的那一轴。"""
@@ -1212,14 +1382,40 @@ class TankGame:
 
         判定必须和 ai_shoot 用的是同一把尺子（ai_shot_line_clear）：
         否则会出现“认为自己在瞄准所以站住，但实际开不出火”的干站。
+        另外加了个耐心值：两个 AI 互相站定对射、偏偏都差几像素打不中时，
+        会变成永久对峙，超过 AI_HOLD_PATIENCE 就强制换位置。
         """
         player = self.player.rect
+        holding = False
         for enemy in self.enemies:
             if not self.ai_shot_line_clear(enemy):
                 continue
             gap = (abs(enemy.rect.centerx - player.centerx)
                    + abs(enemy.rect.centery - player.centery))
             if gap >= AI_HOLD_DISTANCE:
+                holding = True
+                break
+        if holding:
+            self.ai_hold_frames += 1
+            if self.ai_hold_frames > AI_HOLD_PATIENCE:
+                self.ai_hold_frames = 0
+                self.ai_path = None
+                return False
+        else:
+            self.ai_hold_frames = 0
+        return holding
+
+    def ai_engage(self):
+        """贴脸对射：最近敌人就在两个车身内、且视线畅通时，站定开火。
+
+        以前贴身时旧判定要求“横向距离 > 半个车身”才算有射界，贴上了就永远
+        判 False；AI 想往前走又被敌车顶住，于是每帧在两点之间来回抽。
+        """
+        player = self.player.rect
+        for enemy in self.enemies:
+            gap = max(abs(enemy.rect.centerx - player.centerx),
+                      abs(enemy.rect.centery - player.centery))
+            if gap <= AI_CLOSE_RANGE and self.ai_aim_direction(enemy):
                 return True
         return False
 
@@ -1269,13 +1465,34 @@ class TankGame:
         anchor_x = self.offset_x + cell[0] * BLOCK_SIZE
         anchor_y = self.offset_y + cell[1] * BLOCK_SIZE
 
+        # 贴脸对射优先：这时“回格心”会让车一直小幅挪，而 engage 又要求站定，
+        # 两者每帧互相推翻 —— 表现就是贴着敌人原地抽。先判交战，再谈走位。
+        if self.ai_engage():
+            self.ai_heading = None
+            return STAY
+
         if (abs(rect.x - anchor_x) > AI_TURN_TOLERANCE
                 or abs(rect.y - anchor_y) > AI_TURN_TOLERANCE):
             if self.ai_heading and self.ai_can_step(self.ai_heading):
                 return self.ai_heading
-            if abs(rect.x - anchor_x) >= abs(rect.y - anchor_y):
-                return (1 if anchor_x > rect.x else -1, 0)
-            return (0, 1 if anchor_y > rect.y else -1)
+            # 两条轴按偏差从大到小依次尝试，**跳过走不通的那条**。
+            # 以前只看偏差大的那条，如果它恰好被砖/敌车顶住就返回 None，
+            # 交给兜底乱走；下一帧换成另一条轴，于是 A-B-A-B 来回抽。
+            #
+            # 这里刻意不用“超过容差”作门槛：偏差正好等于容差（很常见，
+            # 车被拐角辅助推了半格）时会被跳过，而另一条轴又走不通，
+            # 就只剩下“每帧返回 None”。只要位置还不正，就值得挪回去。
+            options = []
+            for delta, direction in (
+                    (rect.x - anchor_x, (1 if anchor_x > rect.x else -1, 0)),
+                    (rect.y - anchor_y, (0, 1 if anchor_y > rect.y else -1))):
+                if abs(delta) > px(1):
+                    options.append((abs(delta), direction))
+            options.sort(key=lambda item: -item[0])
+            for _, direction in options:
+                if self.ai_can_step(direction):
+                    return direction
+            return None
 
         if self.ai_hold_distance():
             self.ai_heading = None
@@ -1305,9 +1522,20 @@ class TankGame:
                     # 差半个车身的话炮口会偏到砖块一侧，永远只打掉同一排砖，
                     # 洞口永远只有半格高，车过不去 —— 这也是之前“打半天不穿”的原因。
                     if abs(rect.x - anchor_x) > px(2) or abs(rect.y - anchor_y) > px(2):
-                        if abs(rect.x - anchor_x) >= abs(rect.y - anchor_y):
-                            return (1 if anchor_x > rect.x else -1, 0)
-                        return (0, 1 if anchor_y > rect.y else -1)
+                        # 对齐方向同样要挑能走的：被砖或敌车顶住时硬返回一个方向，
+                        # 上层会当成“有方向”直接驱车，结果一步没动，下一帧又换轴。
+                        align = []
+                        if abs(rect.x - anchor_x) > px(2):
+                            align.append((abs(rect.x - anchor_x),
+                                          (1 if anchor_x > rect.x else -1, 0)))
+                        if abs(rect.y - anchor_y) > px(2):
+                            align.append((abs(rect.y - anchor_y),
+                                          (0, 1 if anchor_y > rect.y else -1)))
+                        align.sort(key=lambda item: -item[0])
+                        for _, direction in align:
+                            if self.ai_can_step(direction):
+                                return direction
+                        return None
                     self.ai_shoot_block((nxt[0] - cell[0], nxt[1] - cell[1]))
                     self.ai_heading = None
                     return STAY
@@ -1325,37 +1553,86 @@ class TankGame:
         return self.player.move(dx * self.player.speed, dy * self.player.speed,
                                 self.walls, self.all_sprites)
 
+    def ai_fallback_direction(self):
+        """实在没主意时的兜底：沿用同一个方向若干帧，别每帧挑第一个能走的。
+
+        “每帧取第一个能走的方向”是抽搐的经典来源：撞墙换一条、下一帧又换回来。
+        """
+        if self.ai_wander_hold > 0 and self.ai_can_step(self.ai_wander_dir):
+            self.ai_wander_hold -= 1
+            return self.ai_wander_dir
+        options = [d for d in (UP, DOWN, LEFT, RIGHT) if self.ai_can_step(d)]
+        if not options:
+            return None
+        player = self.player.rect
+        if self.enemies:
+            # 往远离最近敌人的方向退，别顶着对方车身原地磨
+            enemy = min(self.enemies,
+                        key=lambda item: abs(item.rect.centerx - player.centerx)
+                        + abs(item.rect.centery - player.centery))
+            dx = enemy.rect.centerx - player.centerx
+            dy = enemy.rect.centery - player.centery
+            options.sort(key=lambda d: -(d[0] * dx + d[1] * dy))
+        self.ai_wander_dir = options[0]
+        self.ai_wander_hold = 10
+        return self.ai_wander_dir
+
     def auto_play(self):
         """托管模式下代替玩家操作。
 
-        注意 STAY 和 None 是两回事：STAY 是“主动站住”（定点开火/砸墙），
-        None 才是“没主意”。以前把两者混在一起，站定点射时会被当成没主意
-        随手挪一步，于是每帧在两点之间来回抽。
+        STAY 是“主动站住”（定点开火 / 砸墙），None 才是“没主意”，两者必须分开：
+        以前混在一起，站定点射时会被当成没主意随手挪一步，每帧在两点之间来回抽。
+
+        移动的链路是“先定意图，再做安全检查”：
+          ai_evade（原地就要中弹？）→ 开火 → ai_peek / ai_advance（意图）
+          → ai_pick_safe（这一步会不会把车送进弹道）→ 执行。
         """
         direction = self.ai_evade()
         if direction is STAY:
             return
         self.ai_shoot()
+        # 交战中优先站定对射：侧移 peek 会把刚对准的炮口挪开，
+        # 和 ai_advance 的“站定”每帧互相推翻，就是贴着敌人抽的来源。
+        if direction is None and (self.ai_engage() or self.ai_hold_distance()):
+            direction = STAY
         if direction is None:
             direction = self.ai_peek()
         if direction is None:
             direction = self.ai_advance()
+
+        tracks = self.ai_bullet_tracks()
+        stand_hit = self.ai_first_hit(STAY, tracks) if tracks else None
+
         if direction is STAY:
+            # 站定对射；但站着下一帧就要挨枪的话，还是先让开
+            if stand_hit is not None:
+                dodged = self.ai_dodge_direction(tracks)
+                if dodged is STAY:
+                    return
+                if dodged is not None and self.ai_drive(dodged):
+                    self.ai_path = None
             return
+
         if direction is None:
-            direction = next((d for d in (UP, DOWN, LEFT, RIGHT)
-                              if self.ai_can_step(d)), None)
+            direction = self.ai_fallback_direction()
         if direction is None:
             return
-        if self.ai_drive(direction):
+
+        # 路径安全检查：想走的方向会不会把车送进弹道
+        safe = self.ai_pick_safe(direction, tracks)
+        if safe != direction:
+            self.ai_path = None        # 计划被打断，下一帧按新位置重算
+            self.ai_heading = None
+        if self.ai_drive(safe):
             return
-        # 想走的方向被挡住就换一条，别在原地耗着
+
+        # 还是走不通（被墙 / 敌车顶住）：换一条能走的方向
         self.ai_path = None
         for alternative in (UP, DOWN, LEFT, RIGHT):
-            if alternative != direction and self.ai_can_step(alternative):
+            if alternative != safe and self.ai_can_step(alternative):
                 if self.ai_drive(alternative):
                     self.ai_heading = alternative
-                return
+                    return
 
     # ---------- 绘制 ----------
 
